@@ -5,12 +5,16 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.95"
+bytes = "1.9.0"
 clap = { version = "4.5.27", features = ["derive"] }
 data-encoding = "2.7.0"
+ed25519-dalek = "2.1.1"
 futures-lite = "2.6.0"
 iroh = "0.31.0"
 iroh-gossip = "0.31.0"
+postcard = "1.1.1"
 rand = "0.8.5"
 serde = "1.0.217"
 serde_json = "1.0.137"
 tokio = "1.43.0"
+tracing-subscriber = "0.3.19"
