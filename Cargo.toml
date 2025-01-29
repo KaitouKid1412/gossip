@@ -13,7 +13,7 @@ identifier = "com.yourname.yourapp"
 icon = ["assets/icon.png"]
 version = "0.1.0"
 copyright = "Copyright (c) Your Name 2024. All rights reserved."
-category = "Chat"
+category = "public.app-category.social-networking"
 short_description = "A secure chat application"
 long_description = """
 A secure peer-to-peer chat application built with iroh-gossip.
