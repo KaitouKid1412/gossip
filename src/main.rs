@@ -16,6 +16,9 @@ use iroh_gossip::{
     proto::TopicId,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
+mod gui;
 
 /// Chat over iroh-gossip
 ///
@@ -28,28 +31,21 @@ use serde::{Deserialize, Serialize};
 /// By default, the relay server run by n0 is used. To use a local relay server, run
 ///     cargo run --bin iroh-relay --features iroh-relay -- --dev
 /// in another terminal and then set the `-d http://localhost:3340` flag on this example.
-#[derive(Parser, Debug)]
+#[derive(Debug, Clone)]
 struct Args {
     /// secret key to derive our node id from.
-    #[clap(long)]
     secret_key: Option<String>,
     /// Set a custom relay server. By default, the relay server hosted by n0 will be used.
-    #[clap(short, long)]
     relay: Option<RelayUrl>,
     /// Disable relay completely.
-    #[clap(long)]
     no_relay: bool,
     /// Set your nickname.
-    #[clap(short, long)]
     name: Option<String>,
     /// Set the bind port for our socket. By default, a random port will be used.
-    #[clap(short, long, default_value = "0")]
     bind_port: u16,
-    #[clap(subcommand)]
-    command: Command,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Debug, Clone)]
 enum Command {
     /// Open a chat room for a topic and print a ticket for others to join.
     ///
@@ -68,19 +64,69 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let args = Args::parse();
+    let args = Args {
+        secret_key: None,
+        relay: None,
+        no_relay: false,
+        name: None,
+        bind_port: 0,
+    };
 
+    let (sender_chat, mut receiver_chat) = tokio::sync::mpsc::channel::<String>(100);
+    let (gui_tx, gui_rx) = mpsc::unbounded_channel();
+    
+    // Create channels for handling join/create commands from GUI
+    let (command_tx, mut command_rx) = mpsc::channel::<Command>(10);
+    
+    // Spawn network task
+    let gui_tx_clone = gui_tx.clone();
+    let args_clone = args.clone();
+    let network_handle = tokio::spawn(async move {
+        // Wait for commands from GUI (either create or join)
+        while let Some(command) = command_rx.recv().await {
+            if let Err(e) = run_network(args_clone.clone(), command, &mut receiver_chat, gui_tx_clone.clone()).await {
+                eprintln!("Network error: {}", e);
+            }
+        }
+    });
+
+    // Create and run single window with command channel
+    let gui_window = gui::ChatWindow::new(sender_chat, gui_rx, command_tx);
+    if let Err(e) = gui_window.run() {
+        eprintln!("GUI error: {}", e);
+    }
+
+    network_handle.abort();
+    Ok(())
+}
+
+async fn run_network(
+    args: Args,
+    command: Command,
+    mut receiver_chat: &mut tokio::sync::mpsc::Receiver<String>,
+    gui_tx: mpsc::UnboundedSender<String>,
+) -> Result<()> {
     // parse the cli command
-    let (topic, peers) = match &args.command {
+    let (topic, peers) = match command {
         Command::Open { topic } => {
             let topic = topic.unwrap_or_else(|| TopicId::from_bytes(rand::random()));
             println!("> opening chat room for topic {topic}");
             (topic, vec![])
         }
         Command::Join { ticket } => {
-            let Ticket { topic, peers } = Ticket::from_str(ticket)?;
-            println!("> joining chat room for topic {topic}");
-            (topic, peers)
+            println!("> attempting to parse ticket: {}", ticket);
+            match Ticket::from_str(&ticket) {
+                Ok(Ticket { topic, peers }) => {
+                    println!("> successfully parsed ticket with topic {topic}");
+                    (topic, peers)
+                }
+                Err(e) => {
+                    let error_msg = format!("> failed to parse ticket: {}", e);
+                    println!("{}", error_msg);
+                    gui_tx.send(error_msg).ok();
+                    bail!("Failed to parse ticket: {}", e);
+                }
+            }
         }
     };
 
@@ -118,7 +164,9 @@ async fn main() -> Result<()> {
         let peers = peers.iter().cloned().chain([me]).collect();
         Ticket { topic, peers }
     };
-    println!("> ticket to join us: {ticket}");
+    println!("> Join Token: {ticket}");
+    // Send ticket to GUI with special prefix for handling
+    gui_tx.send(format!("Ticket: {ticket}")).ok();
 
     // setup router
     let router = iroh::protocol::Router::builder(endpoint.clone())
@@ -129,16 +177,16 @@ async fn main() -> Result<()> {
     // join the gossip topic by connecting to known peers, if any
     let peer_ids = peers.iter().map(|p| p.node_id).collect();
     if peers.is_empty() {
-        println!("> waiting for peers to join us...");
+        gui_tx.send("> Waiting for peers to join...".to_string()).ok();
     } else {
-        println!("> trying to connect to {} peers...", peers.len());
+        gui_tx.send(format!("> Trying to connect to {} peers...", peers.len())).ok();
         // add the peer addrs from the ticket to our endpoint's addressbook so that they can be dialed
         for peer in peers.into_iter() {
             endpoint.add_node_addr(peer)?;
         }
     };
     let (sender, receiver) = gossip.subscribe_and_join(topic, peer_ids).await?.split();
-    println!("> connected!");
+    gui_tx.send("> Connected!".to_string()).ok();
 
     // broadcast our name, if set
     if let Some(name) = args.name {
@@ -147,31 +195,39 @@ async fn main() -> Result<()> {
         sender.broadcast(encoded_message).await?;
     }
 
-    // subscribe and print loop
-    tokio::spawn(subscribe_loop(receiver));
+    // Pass the GUI sender to subscribe_loop
+    println!("> Spawning message receiver...");
+    let subscribe_handle = tokio::spawn(subscribe_loop(receiver, gui_tx.clone()));
 
-    // spawn an input thread that reads stdin
-    // not using tokio here because they recommend this for "technical reasons"
-    let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(1);
-    std::thread::spawn(move || input_loop(line_tx));
-
-    // broadcast each line we type
-    println!("> type a message and hit enter to broadcast...");
-    while let Some(text) = line_rx.recv().await {
+    // Spawn a task to handle messages from the GUI
+    let endpoint_clone = endpoint.clone();
+    
+    // Handle messages from GUI
+    while let Some(text) = receiver_chat.recv().await {
+        println!("> Sending message from GUI: {}", text);
         let message = Message::Message { text: text.clone() };
-        let encoded_message = SignedMessage::sign_and_encode(endpoint.secret_key(), &message)?;
-        sender.broadcast(encoded_message).await?;
-        println!("> sent: {text}");
+        let name = "You";
+        let chat_msg = format!("{}: {}", name, text);
+        gui_tx.send(chat_msg).ok();
+        
+        if let Ok(encoded_message) = SignedMessage::sign_and_encode(endpoint_clone.secret_key(), &message) {
+            if let Err(e) = sender.broadcast(encoded_message).await {
+                eprintln!("Failed to broadcast message: {}", e);
+            }
+        }
     }
 
-    // shutdown
+    // Cleanup
+    subscribe_handle.abort();
     router.shutdown().await?;
-
+    
     Ok(())
 }
 
-async fn subscribe_loop(mut receiver: GossipReceiver) -> Result<()> {
-    // init a peerid -> name hashmap
+async fn subscribe_loop(
+    mut receiver: GossipReceiver,
+    gui_sender: mpsc::UnboundedSender<String>,
+) -> Result<()> {
     let mut names = HashMap::new();
     while let Some(event) = receiver.try_next().await? {
         if let Event::Gossip(GossipEvent::Received(msg)) = event {
@@ -179,13 +235,17 @@ async fn subscribe_loop(mut receiver: GossipReceiver) -> Result<()> {
             match message {
                 Message::AboutMe { name } => {
                     names.insert(from, name.clone());
-                    println!("> {} is now known as {}", from.fmt_short(), name);
+                    let status_msg = format!("> {} is now known as {}", from.fmt_short(), name);
+                    println!("{}", status_msg);
+                    gui_sender.send(status_msg).ok();
                 }
                 Message::Message { text } => {
                     let name = names
                         .get(&from)
                         .map_or_else(|| from.fmt_short(), String::to_string);
-                    println!("{}: {}", name, text);
+                    let chat_msg = format!("{}: {}", name, text);
+                    println!("{}", chat_msg);
+                    gui_sender.send(chat_msg).ok();
                 }
             }
         }
